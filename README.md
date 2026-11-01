@@ -1,6 +1,6 @@
-# Bolo-ruminal — prototipo didáctico
+# Bolo-ruminal — prototipo 
 
-Prototipo de banco de un **bolo ruminal**: un dispositivo que va dentro del rumen de la vaca, mide **movimiento** y **temperatura** y manda los datos por **LoRa (915 MHz)** a un gateway.
+Prototipo de banco de un BOLO RUMINAL: un dispositivo que va dentro del rumen de la vaca, mide MOVIMIENTO y TERMPERATURA y manda los datos por LORA (915MHZ) a un gateway.
 
 Este repo es el **prototipo de aprendizaje**, armado con placas de desarrollo. Sirve para validar los sensores, la lógica de detección, el enlace de radio y las técnicas de ahorro de batería. El código está separado en capas para poder reutilizarlo en el bolo final (STM32WLE5, radio integrada).
 
