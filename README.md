@@ -1,6 +1,6 @@
 # Bolo-ruminal — prototipo 
 
-Prototipo de banco de un BOLO RUMINAL: un dispositivo que va dentro del rumen de la vaca, mide MOVIMIENTO y TERMPERATURA y manda los datos por LORA (915MHZ) a un gateway.
+Prototipo de banco de un BOLO RUMINAL: un dispositivo que va dentro del rumen de la vaca, mide MOVIMIENTO y TEMPERATURA y manda los datos por LORA (915MHZ) a un gateway.
 
 Este repo es el **prototipo de aprendizaje**, armado con placas de desarrollo. Sirve para validar los sensores, la lógica de detección, el enlace de radio y las técnicas de ahorro de batería. El código está separado en capas para poder reutilizarlo en el bolo final (STM32WLE5, radio integrada).
 
@@ -33,22 +33,54 @@ Este repo es el **prototipo de aprendizaje**, armado con placas de desarrollo. S
 | SHT31-D | Temperatura (±0,2 °C) y humedad interna (control del sellado) |
 | Wio-SX1262 (862–930 MHz) | Radio LoRa, con TCXO controlado por DIO3 |
 
-### Conexiones (iguales en TX y RX para la radio)
+### Conexiones
 
-| Señal | Pin STM32 | Pin Nucleo |
+Todos los módulos se alimentan desde la Nucleo: **+3V3** y **GND** comunes.
+
+#### BOLO_TX — Acelerómetro MPU-6050 (GY-521)
+
+| Pin del módulo | Pin Nucleo | Pin STM32 | Nota |
+|---|---|---|---|
+| VCC | +3V3 | — | |
+| GND | GND | — | |
+| SCL | D5 | PB6 | I2C1 (compartido con el SHT31) |
+| SDA | D4 | PB7 | I2C1 (compartido con el SHT31) |
+| AD0 | sin conectar | — | el módulo lo lleva a GND → dirección I2C 0x68 |
+| INT, XDA, XCL | sin conectar | — | |
+
+#### BOLO_TX — Sensor de temperatura SHT31-D
+
+| Pin del módulo | Pin Nucleo | Pin STM32 | Nota |
+|---|---|---|---|
+| VIN | +3V3 | — | |
+| GND | GND | — | |
+| SCL | D5 | PB6 | I2C1 (compartido con el MPU-6050) |
+| SDA | D4 | PB7 | I2C1 (compartido con el MPU-6050) |
+| ADR | sin conectar | — | queda en bajo → dirección I2C 0x44 (en la PCB: a GND) |
+
+#### BOLO_TX y BOLO_RX — Radio Wio-SX1262 (igual en las dos placas)
+
+| Señal del SX1262 | Pin Nucleo | Pin STM32 | Función |
+|---|---|---|---|
+| 3V3 | +3V3 | — | alimentación |
+| GND | GND | — | |
+| SCK | A1 | PA1 | SPI1 reloj |
+| MISO | D12 | PB4 | SPI1 datos radio → micro |
+| MOSI | D11 | PB5 | SPI1 datos micro → radio |
+| NSS | A3 | PA4 | selección del chip (activo en bajo) |
+| RST | A6 | PA7 | reset por hardware (activo en bajo) |
+| BUSY | A0 | PA0 | el chip está ocupado (no acepta comandos) |
+| DIO1 | A2 | PA3 | aviso de interrupción (TxDone, RxDone, errores) |
+| RF_SW | D10 | PA11 | llave de antena (bajo = TX, alto = RX) |
+
+#### Recursos propios de la Nucleo (sin cableado externo)
+
+| Recurso | Pin STM32 | Uso |
 |---|---|---|
-| SPI1 SCK | PA1 | A1 |
-| SPI1 MISO | PB4 | D12 |
-| SPI1 MOSI | PB5 | D11 |
-| LoRa NSS | PA4 | A3 |
-| LoRa RST | PA7 | A6 |
-| LoRa BUSY | PA0 | A0 |
-| LoRa DIO1 | PA3 | A2 |
-| LoRa RF_SW | PA11 | D10 |
-| I2C1 SCL (solo TX) | PB6 | D5 |
-| I2C1 SDA (solo TX) | PB7 | D4 |
-| UART2 → PC (ST-LINK VCP) | PA2 / PA15 | — |
-| LED LD3 | PB3 | D13 |
+| USART2 TX / RX | PA2 / PA15 | ST-LINK VCP → PC (PuTTY, 115200 8N1) |
+| LED LD3 | PB3 (D13) | encendido mientras mide (BOLO_TX) / pulso por paquete (BOLO_RX) |
+| Cristal LSE 32,768 kHz | PC14 / PC15 | reloj del RTC (despertador del STOP2) |
+| SWD | PA13 / PA14 | programación y depuración |
 
 > **Nota:** en la Nucleo-32 los puentes SB16/SB18 unen PA5↔PB6 y PA6↔PB7. Por eso el SPI va en PA1/PB4/PB5 y PA5/PA6 quedan sin usar.
 
