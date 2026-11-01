@@ -1,0 +1,40 @@
+# ============================================================
+#  Bolo-ruminal: solo se versiona el proyecto del bolo.
+#  La carpeta tiene otros proyectos de CubeIDE que NO van al repo.
+# ============================================================
+/*
+!/.gitignore
+!/README.md
+!/BOLO_TX/
+!/BOLO_RX/
+
+# ---- Compilados de STM32CubeIDE (se regeneran con Build) ----
+Debug/
+Release/
+
+# ---- Backups manuales (el historial de git los reemplaza) ----
+_backup/
+_para_borrar/
+
+# ---- CMSIS completo que CubeMX copio en el TX ----
+# No se compila (esta excluido en el .cproject) y son ~850 archivos.
+BOLO_TX/Drivers/CMSIS/DSP/
+BOLO_TX/Drivers/CMSIS/NN/
+BOLO_TX/Drivers/CMSIS/RTOS/
+BOLO_TX/Drivers/CMSIS/RTOS2/
+BOLO_TX/Drivers/CMSIS/docs/
+
+# ---- Restos de otros IDEs que no se usan ----
+EWARM/
+MDK-ARM/
+
+# ---- Configuracion local de cada PC (rutas propias) ----
+*.launch
+.settings/
+
+# ---- Varios ----
+*.zip
+*.bak
+*.tmp
+Thumbs.db
+desktop.ini
