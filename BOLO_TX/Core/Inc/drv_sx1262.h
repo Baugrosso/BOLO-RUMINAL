@@ -25,6 +25,8 @@ typedef enum
 
 /* ---- Registros que usamos ---- */
 #define SX1262_REG_LORA_SYNC_WORD   0x0740U   /* 2 bytes; valor de fabrica 0x14 0x24 */
+#define SX1262_REG_OCP              0x08E7U   /* limite de corriente del PA (2,5 mA por paso) */
+#define SX1262_OCP_140MA            0x38U     /* lo que pide +22 dBm                         */
 
 /* ---- Byte de estado (GetStatus): bits 6:4 = modo, bits 3:1 = resultado del comando ---- */
 #define SX1262_MODO(status)         (((status) >> 4) & 0x07U)
@@ -94,7 +96,7 @@ typedef enum
 #define SX1262_IRQ_TIMEOUT          (1U << 9)
 #define SX1262_IRQ_TODAS            0x03FFU
 
-#define SX1262_MAX_PAYLOAD          64U       /* lo maximo que dejamos mandar de una vez */
+#define SX1262_MAX_PAYLOAD          66U       /* lo maximo que dejamos mandar de una vez (SF9) */
 
 /* ---- Etapa 1 ---- */
 sx_status_t sx1262_init(SPI_HandleTypeDef *hspi);          /* guarda el SPI y resetea */
@@ -134,6 +136,13 @@ sx_status_t sx1262_set_rx(uint32_t timeout_pasos);
 sx_status_t sx1262_get_rx_buffer_status(uint8_t *largo, uint8_t *inicio);
 sx_status_t sx1262_read_buffer(uint8_t offset, uint8_t *datos, uint8_t n);
 sx_status_t sx1262_get_packet_status(int16_t *rssi_dbm, int8_t *snr_x4);
+
+/* ---- Escritura de registros y modo de reposo entre operaciones ---- */
+#define SX1262_FALLBACK_STDBY_RC    0x20U     /* despues de TX/RX vuelve a STDBY_RC (TCXO apagado)   */
+#define SX1262_FALLBACK_STDBY_XOSC  0x30U     /* vuelve a STDBY_XOSC: el TCXO queda prendido y la
+                                               * proxima operacion arranca sin esperar 5 ms         */
+sx_status_t sx1262_write_register(uint16_t addr, const uint8_t *buf, uint8_t n);
+sx_status_t sx1262_set_fallback(uint8_t modo);
 
 /* ---- Etapa 4: bajo consumo ---- */
 sx_status_t sx1262_set_sleep(bool warm_start);   /* dormir (< 1 uA)                  */

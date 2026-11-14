@@ -1,6 +1,6 @@
 /**
  * @file    bolo_types.h
- * @brief   Tipos de datos compartidos por todos los modulos del prototipo.
+ * @brief   Tipos de datos compartidos por los modulos del BOLO_TX.
  */
 #ifndef BOLO_TYPES_H
 #define BOLO_TYPES_H
@@ -8,85 +8,36 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-/* =========================================================
- *  1. ESTADO DEL BOLO
- * ========================================================= */
-typedef enum
-{
-  BOLO_ESTADO_DESCONOCIDO = 0,   /* sin dato valido (arranque o error) */
-  BOLO_ESTADO_REPOSO,            /* = 1 */
-  BOLO_ESTADO_MOV_SUAVE,         /* = 2 */
-  BOLO_ESTADO_MOV_FUERTE         /* = 3 */
-} bolo_estado_t;
-
-/* Estado termico (lo decide thermal.c) */
-typedef enum
-{
-  TERM_SIN_DATO = 0,             /* no hubo temperatura valida este ciclo      */
-  TERM_APRENDIENDO,              /* juntando mediciones para la base inicial   */
-  TERM_NORMAL,                   /* cerca de la linea de base                  */
-  TERM_BAJADA,                   /* cayo bajo la base (posible toma de agua)   */
-  TERM_SUBA                      /* subio sobre la base (SOLO DEMO, ver config) */
-} term_estado_t;
-
-/* =========================================================
- *  2. MUESTRA CRUDA DEL ACELEROMETRO (tal cual la da el sensor)
- * ========================================================= */
+/* Muestra cruda del acelerometro (tal cual la da el sensor) */
 typedef struct
 {
   int16_t x;
   int16_t y;
   int16_t z;
-} acc_raw_t;                     /* 6 bytes */
+} acc_raw_t;
 
-/* =========================================================
- *  3. VECTOR EN UNIDADES FISICAS [g]
- * ========================================================= */
+/* Resultado de una epoca de 20 s (opcion B): sin clases, solo numeros.
+ * Si la epoca es invalida (< 50 muestras), desvio_cod = 0xFF y las medias no se usan. */
 typedef struct
 {
-  float x;
-  float y;
-  float z;
-} acc_vec_t;
+  int16_t  x_mg;          /* media de cada eje [1 mg], ya limitada a 12 bits con signo */
+  int16_t  y_mg;
+  int16_t  z_mg;
+  uint8_t  desvio_cod;    /* desvio de la magnitud, codigo log de 8 bits (ver motion.h) */
+  uint16_t n_muestras;    /* muestras que entraron en la epoca                          */
+} epoca_t;
 
-/* =========================================================
- *  4. RESULTADO DE UN CICLO COMPLETO
- * ========================================================= */
-typedef struct
+/* Causa del ultimo reinicio (4 bits en los metadatos del periodo).
+ * 0 = no hubo reinicio en este periodo. */
+typedef enum
 {
-  uint32_t      ciclo;          /* numero de ciclo desde el arranque      */
-  bolo_estado_t estado;         /* REPOSO / MOVIMIENTO                    */
-  acc_vec_t     media;          /* promedio de cada eje en la ventana [g] */
-  acc_vec_t     desvio;         /* desvio estandar de cada eje [g]        */
-  float         desvio_max;     /* el mayor de los tres desvios [g]       */
-  float         desvio_mag;     /* desvio de la magnitud |a| [g]          */
-  uint16_t      n_muestras;     /* muestras validas que se leyeron        */
-  bool          error_sensor;   /* true si fallo la comunicacion          */
-
-  int16_t       temp_centi;     /* temperatura en centesimas de C (2502 = 25,02 C) */
-  uint16_t      hum_centi;      /* humedad interna en centesimas de %              */
-  bool          temp_ok;        /* true si la lectura fue valida (CRC OK)          */
-
-  /* Evento termico (thermal.c) */
-  int16_t       temp_base_centi;    /* linea de base aprendida [centi-C]          */
-  int16_t       temp_delta_centi;   /* medicion - base [centi-C]                  */
-  term_estado_t term_estado;        /* SIN_DATO / NORMAL / BAJADA / SUBA          */
-  uint16_t      term_ciclos_evento; /* evento: ciclos que lleva | aprendiendo: n  */
-  /* Resumen del evento que TERMINO en este ciclo (term_fin_tipo = SIN_DATO: ninguno) */
-  term_estado_t term_fin_tipo;          /* BAJADA o SUBA                          */
-  uint16_t      term_fin_ciclos;        /* cuantos ciclos duro                    */
-  int16_t       term_fin_extremo_centi; /* delta minimo (BAJADA) o maximo (SUBA)  */
-  bool          term_fin_por_tope;      /* true: se corto por tope y se reaprendio la base */
-
-  /* Diagnostico del ciclo */
-  uint16_t      fallas_lectura; /* lecturas del acelerometro que fallaron          */
-  uint16_t      ventana_ms;     /* duracion real de la ventana de sensado [ms]     */
-  bool          ventana_cortada;/* true si se aborto (fallas seguidas o tiempo)    */
-  bool          bus_recuperado; /* true si se destrabo y reinicio el bus I2C       */
-
-  /* A futuro (se agregan aca, sin tocar el resto):
-   * uint16_t bateria_mv;        <- ADC
-   */
-} bolo_data_t;
+  RST_NINGUNO     = 0,
+  RST_ENCENDIDO   = 1,     /* encendido o caida de tension (BOR) */
+  RST_BOTON       = 2,
+  RST_SOFTWARE    = 3,     /* incluye la carga desde CubeIDE     */
+  RST_WATCHDOG    = 4,
+  RST_HARDFAULT   = 5,
+  RST_DESCONOCIDO = 15
+} rst_causa_t;
 
 #endif /* BOLO_TYPES_H */

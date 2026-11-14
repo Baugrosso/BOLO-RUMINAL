@@ -1,6 +1,8 @@
 /**
  * @file    drv_sht31.h
  * @brief   Driver del SHT31 (temperatura y humedad), modo single shot.
+ *          Comando 0x2400 (alta repetibilidad, sin clock stretching) y CRC-8
+ *          (polinomio 0x31, inicio 0xFF) en cada palabra.
  */
 #ifndef DRV_SHT31_H
 #define DRV_SHT31_H
@@ -8,8 +10,9 @@
 #include "main.h"
 #include <stdint.h>
 
-/* Tiempo maximo de una medicion en alta repetibilidad (datasheet) */
-#define SHT31_T_MEDICION_MS   15U
+/* Medicion single shot en alta repetibilidad: max 15,5 ms (datasheet) -> se esperan
+ * 16 ms con el LPTIM1 (el micro sigue en STOP2 mientras el sensor mide) */
+#define SHT31_T_MEDICION_MS   16U
 
 typedef enum
 {

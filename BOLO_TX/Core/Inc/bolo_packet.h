@@ -1,95 +1,101 @@
 /**
  * @file    bolo_packet.h
- * @brief   Formato del paquete LoRa del bolo. Es el MISMO archivo en el bolo (TX)
- *          y en el gateway (RX): el formato queda definido aca, byte por byte.
+ * @brief   Formatos de aire del bolo (T9-T12): metadatos del periodo, hola,
+ *          te oigo, fragmento y ACK. Todo en big-endian y con los campos de bits
+ *          en el orden de la lista (el primero en los bits mas altos).
+ *          La descripcion completa esta en BOLO_TX/PROTOCOLO.md.
  *
- *  Version 1 (prototipo, "opcion A"): largo FIJO de 18 bytes. El resumen del
- *  evento termico va siempre (en cero si no termino ningun evento).
- *  Pendiente para el bolo final ("opcion B", nueva version): el resumen del
- *  evento se agrega solo cuando termina un evento (~15 B el resto del tiempo).
+ *  Metadatos del periodo (12 B):
+ *    [version 4 b | cant. epocas 12 b][n. periodo 16 b][marca de tiempo 32 b]
+ *    [cant. temperaturas 8 b][VDD 8 b: 1,80 V + codigo x 7 mV]
+ *    [causa reset 4 b | contactos sin ACK 4 b][fallas: acelerometro 4 b | temperatura 4 b]
  *
- *  Mapa de bytes (los numeros de 16 bits van en little-endian: primero el byte bajo)
- *   0      version (bits 7-4) | tipo (bits 3-0)
- *   1      ID del nodo
- *   2-3    secuencia (u16)
- *   4      movimiento (bits 1-0) | estado termico (bits 4-2)
- *   5      banderas: b0 temp valida, b1 ventana cortada, b2 bus I2C recuperado,
- *                    b3 termino un evento, b4-6 causa del ultimo reinicio,
- *                    b7 el evento que termino era una SUBA (0 = BAJADA)
- *   6-7    desvio de los ejes (maximo)  u16  [0,1 mg]
- *   8-9    desvio de la magnitud        u16  [0,1 mg]
- *   10-11  temperatura                  i16  [0,01 C]
- *   12-13  delta termico (T - base)     i16  [0,01 C]
- *   14     humedad interna              u8   [1 %]
- *   15     duracion del evento          u8   [ciclos]
- *   16-17  delta extremo del evento     i16  [0,01 C]
+ *  hola (bolo -> gateway, canal de encuentro, 6 B):
+ *    [tipo 4 b = 1 | version 4 b][ID nodo][contacto][cant. fragmentos 16 b][banderas]
+ *    banderas: bit 0 = no tengo ranura (pido hora y ranura)
+ *  te oigo (gateway -> bolo, canal de encuentro, 3 B):
+ *    [tipo 4 b = 2 | version 4 b][ID nodo][contacto]
+ *
+ *  Fragmento (<= 66 B): cabecera de 4 B + hasta 62 B de datos
+ *    [ID nodo 8 b][contacto 8 b][indice 10 b | ultimo 1 b | reserva 5 b]
+ *    ultimo = 1 en el ultimo fragmento de cada tanda (rafaga o ronda de reenvio)
+ *
+ *  ACK (gateway -> bolo, 9 B + bitmap):
+ *    [ID nodo][contacto][estado][hora gateway UNIX 32 b][comando][argumento]
+ *    estado bit 7 = 1: llego todo. Si es 0, sigue el bitmap de faltantes:
+ *    ceil(N/8) bytes, bit i (byte i/8, bit i%8 desde el menos significativo) = 1 si
+ *    falta el fragmento i. Comandos: 0 nada, 1 ranura (arg 0-179), 2 potencia (arg dBm).
  */
 #ifndef BOLO_PACKET_H
 #define BOLO_PACKET_H
 
 #include <stdint.h>
 #include <stdbool.h>
+#include "bolo_config.h"
 
-#define PKT_VERSION         1U
-#define PKT_TIPO_DATOS      1U      /* datos de un ciclo de sensado */
-#define PKT_LARGO_V1        18U
+#define PKT_PROTO_VERSION     1U
 
-/* Movimiento (mismos valores que bolo_estado_t) */
-#define PKT_MOV_DESCONOCIDO 0U
-#define PKT_MOV_REPOSO      1U
-#define PKT_MOV_SUAVE       2U
-#define PKT_MOV_FUERTE      3U
+#define PKT_META_LARGO        12U
+#define PKT_HOLA_LARGO        6U
+#define PKT_TEOIGO_LARGO      3U
+#define PKT_FRAG_CAB          4U
+#define PKT_FRAG_DATOS        62U
+#define PKT_FRAG_MAX          (PKT_FRAG_CAB + PKT_FRAG_DATOS)      /* 66 */
+#define PKT_ACK_MIN           9U
+#define PKT_BITMAP_MAX        (CONT_MAX_FRAG / 8U)                 /* 16 */
+#define PKT_ACK_MAX           (PKT_ACK_MIN + PKT_BITMAP_MAX)       /* 25 */
+#define PKT_CRC_LARGO         4U
 
-/* Estado termico (mismos valores que term_estado_t) */
-#define PKT_TERM_SIN_DATO   0U
-#define PKT_TERM_APRENDE    1U
-#define PKT_TERM_NORMAL     2U
-#define PKT_TERM_BAJADA     3U
-#define PKT_TERM_SUBA       4U
+#define PKT_TIPO_HOLA         1U
+#define PKT_TIPO_TEOIGO       2U
+#define PKT_HOLA_PIDE_RANURA  0x01U
 
-/* Causa del ultimo reinicio (3 bits) */
-#define PKT_RST_DESCONOCIDA 0U
-#define PKT_RST_ENCENDIDO   1U
-#define PKT_RST_BOTON       2U
-#define PKT_RST_SOFTWARE    3U      /* incluye la carga desde CubeIDE */
-#define PKT_RST_WATCHDOG    4U
-#define PKT_RST_HARDFAULT   5U
+#define PKT_ACK_COMPLETO      0x80U
+#define PKT_CMD_NADA          0U
+#define PKT_CMD_RANURA        1U
+#define PKT_CMD_POTENCIA      2U
 
-/* El contenido del paquete, ya en las unidades de transmision */
+_Static_assert(PKT_FRAG_MAX <= 66U, "Payload maximo con SF9: 66 B");
+_Static_assert(CONT_MAX_FRAG <= 1024U && (CONT_MAX_FRAG % 8U) == 0U, "Indice de 10 bits / bitmap en bytes");
+
 typedef struct
 {
   uint8_t  version;
-  uint8_t  tipo;
+  uint16_t n_epocas;
+  uint16_t n_periodo;
+  uint32_t marca;
+  uint8_t  n_th;
+  uint8_t  vdd_cod;
+  uint8_t  causa_reset;
+  uint8_t  sin_ack;
+  uint8_t  fallas_acc;
+  uint8_t  fallas_temp;
+} pkt_meta_t;
+
+typedef struct
+{
   uint8_t  nodo;
-  uint16_t seq;
+  uint8_t  contacto;
+  uint8_t  estado;
+  bool     completo;
+  uint32_t hora;
+  uint8_t  comando;
+  uint8_t  argumento;
+  uint8_t  bitmap[PKT_BITMAP_MAX];
+} pkt_ack_t;
 
-  uint8_t  mov;               /* PKT_MOV_*                      */
-  uint8_t  term;              /* PKT_TERM_*                     */
-  bool     temp_ok;
-  bool     ventana_cortada;
-  bool     bus_recuperado;
-  bool     evento_fin;        /* termino un evento este ciclo   */
-  bool     evento_suba;       /* ese evento era una SUBA        */
-  uint8_t  reinicio;          /* PKT_RST_*                      */
+void    pkt_meta_armar(uint8_t out[PKT_META_LARGO], const pkt_meta_t *m);
+void    pkt_meta_leer(const uint8_t in[PKT_META_LARGO], pkt_meta_t *m);
 
-  uint16_t desvio_ejes_dmg;   /* 0,1 mg */
-  uint16_t desvio_mag_dmg;    /* 0,1 mg */
-  int16_t  temp_centi;        /* 0,01 C */
-  int16_t  delta_centi;       /* 0,01 C */
-  uint8_t  hum_pct;           /* 1 %    */
-  uint8_t  ev_ciclos;
-  int16_t  ev_extremo_centi;  /* 0,01 C */
-} bolo_pkt_t;
+uint8_t pkt_hola_armar(uint8_t *out, uint8_t nodo, uint8_t contacto, uint16_t n_frag, bool pide_ranura);
+bool    pkt_teoigo_valido(const uint8_t *in, uint8_t n, uint8_t nodo, uint8_t contacto);
 
-/* Arma los bytes; devuelve el largo (PKT_LARGO_V1) o 0 si buf es NULL */
-uint8_t     bolo_pkt_encode(const bolo_pkt_t *p, uint8_t *buf);
+void    pkt_frag_cab(uint8_t out[PKT_FRAG_CAB], uint8_t nodo, uint8_t contacto,
+                     uint16_t indice, bool ultimo);
 
-/* Desarma los bytes; false si el largo, la version o el tipo no coinciden */
-bool        bolo_pkt_decode(const uint8_t *buf, uint8_t largo, bolo_pkt_t *p);
-
-/* Textos para mostrar */
-const char *bolo_pkt_mov_str(uint8_t mov);
-const char *bolo_pkt_term_str(uint8_t term);
-const char *bolo_pkt_rst_str(uint8_t rst);
+/* Valida y desarma un ACK para un contacto con n_frag fragmentos */
+bool    pkt_ack_leer(const uint8_t *in, uint8_t n, uint8_t nodo, uint8_t contacto,
+                     uint16_t n_frag, pkt_ack_t *a);
+bool    pkt_ack_falta(const pkt_ack_t *a, uint16_t indice);
 
 #endif /* BOLO_PACKET_H */

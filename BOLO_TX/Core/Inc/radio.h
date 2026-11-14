@@ -1,13 +1,15 @@
 /**
  * @file    radio.h
- * @brief   Interfaz generica de la radio LoRa. La aplicacion usa estas funciones
- *          y no nombra al chip. Es el MISMO archivo en el bolo (TX) y en el
- *          gateway (RX). En el bolo final (STM32WLE5, radio interna) cambia solo
- *          lo que esta debajo de esta interfaz.
- *          Etapa 2a: encendido correcto del chip (TCXO + calibracion).
- *          Etapa 2b: configuracion LoRa y transmision de un paquete.
- *          Etapa 2c: recepcion continua.
- *          Etapa 4:  dormir la radio entre transmisiones (solo el bolo).
+ * @brief   Interfaz generica de la radio LoRa del bolo. La aplicacion usa estas
+ *          funciones y no nombra al chip. En el bolo final (STM32WLE5, radio
+ *          interna) cambia solo lo que esta debajo de esta interfaz.
+ *
+ *  Parametros (T9-T11): SF9, 125 kHz, CR 4/5, preambulo de 8, encabezado
+ *  explicito, CRC; payload maximo 66 B (~390 ms). +22 dBm fijo. TCXO por DIO3 a
+ *  1,8 V y DIO2 como control del conmutador de RF.
+ *
+ *  Las operaciones no bloquean: se arranca una TX o RX y despues se consulta
+ *  radio_evento() mientras el micro atiende el muestreo.
  */
 #ifndef RADIO_H
 #define RADIO_H
@@ -16,12 +18,12 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-#define RADIO_MAX_PAYLOAD   64U      /* bytes maximos por paquete */
+#define RADIO_MAX_PAYLOAD   66U      /* bytes maximos por paquete (SF9) */
 
 /* Pasos de radio_init(), en orden. Si uno falla, queda anotado cual. */
 typedef enum
 {
-  RADIO_PASO_NINGUNO = 0,     /* no fallo nada                              */
+  RADIO_PASO_NINGUNO = 0,
   RADIO_PASO_RESET,           /*  1. reset por hardware                     */
   RADIO_PASO_LEER_ERR,        /*  2. leer errores del arranque              */
   RADIO_PASO_BORRAR_ERR,      /*  3. borrar esos errores                    */
@@ -32,62 +34,54 @@ typedef enum
   RADIO_PASO_CALIB_IMG,       /*  8. calibracion de la banda 902-928        */
   RADIO_PASO_ANTENA,          /*  9. DIO2 maneja la llave de antena         */
   RADIO_PASO_LORA,            /* 10. modo LoRa                              */
-  RADIO_PASO_FRECUENCIA,      /* 11. frecuencia (915 MHz)                   */
-  RADIO_PASO_POTENCIA,        /* 12. amplificador y potencia de salida      */
+  RADIO_PASO_FRECUENCIA,      /* 11. frecuencia (canal de encuentro)        */
+  RADIO_PASO_POTENCIA,        /* 12. amplificador, potencia y OCP           */
   RADIO_PASO_MODULACION,      /* 13. memoria, SF/BW/CR y formato de paquete */
   RADIO_PASO_IRQ,             /* 14. que eventos avisa DIO1                 */
   RADIO_PASO_STBY_XOSC,       /* 15. standby con el TCXO encendido          */
   RADIO_PASO_VERIFICAR        /* 16. errores = 0 y modo = STBY_XOSC         */
 } radio_paso_t;
 
-/* Diagnostico de radio_init(): todo lo que hace falta para saber que paso */
 typedef struct
 {
-  bool         ok;            /* true si la radio quedo lista              */
-  radio_paso_t paso_fallido;  /* primer paso que fallo                     */
-  uint16_t     err_arranque;  /* errores internos justo despues del reset  */
-  uint16_t     err_final;     /* errores despues de toda la configuracion  */
-  uint8_t      estado;        /* GetStatus al final (esperado STBY_XOSC)   */
+  bool         ok;
+  radio_paso_t paso_fallido;
+  uint16_t     err_arranque;
+  uint16_t     err_final;
+  uint8_t      estado;
 } radio_diag_t;
 
-/* Resultado de una transmision */
 typedef enum
 {
-  RADIO_TX_OK = 0,            /* el chip aviso "TxDone"                    */
-  RADIO_TX_ERR_PARAM,         /* paquete vacio o demasiado largo           */
-  RADIO_TX_ERR_SPI,           /* fallo un comando al chip                  */
-  RADIO_TX_ERR_TIMEOUT        /* el chip no aviso a tiempo                 */
-} radio_tx_res_t;
+  RADIO_EV_NINGUNO = 0,       /* todavia nada                              */
+  RADIO_EV_TX_OK,             /* termino de transmitir                     */
+  RADIO_EV_RX_OK,             /* llego un paquete sano (pkt completo)      */
+  RADIO_EV_RX_ERROR,          /* llego algo roto (CRC o encabezado)        */
+  RADIO_EV_TIMEOUT,           /* vencio el tiempo de TX o de RX            */
+  RADIO_EV_FALLA              /* fallo la comunicacion con el chip         */
+} radio_ev_t;
 
 typedef struct
 {
-  radio_tx_res_t res;
-  uint16_t       irq;         /* interrupciones que levanto el chip        */
-  uint32_t       ms;          /* tiempo en el aire medido (SetTx -> DIO1)  */
-} radio_tx_t;
-
-/* Un paquete recibido */
-typedef struct
-{
-  bool     crc_ok;            /* false: llego roto (CRC o encabezado), se descarta */
-  uint8_t  largo;             /* bytes recibidos                                   */
+  uint8_t  largo;
   uint8_t  datos[RADIO_MAX_PAYLOAD];
-  int16_t  rssi_dbm;          /* potencia con que llego [dBm]                      */
-  int8_t   snr_x4;            /* relacion señal/ruido x4 (38 = 9,5 dB)             */
-  uint16_t irq;               /* interrupciones que levanto el chip                */
+  int16_t  rssi_dbm;          /* potencia con que llego [dBm]               */
+  int8_t   snr_x4;            /* relacion senal/ruido x4 (38 = 9,5 dB)      */
 } radio_rx_t;
 
-bool        radio_init(SPI_HandleTypeDef *hspi, radio_diag_t *diag);
-bool        radio_send(const uint8_t *datos, uint8_t largo, radio_tx_t *info);
-bool        radio_rx_start(void);                     /* empieza a escuchar sin parar   */
-bool        radio_rx_poll(radio_rx_t *pkt);           /* true si llego algo (bien o mal) */
-bool        radio_dormir(void);                       /* sleep conservando la configuracion */
-bool        radio_despertar(void);                    /* false: hay que repetir radio_init  */
+bool        radio_init(SPI_HandleTypeDef *hspi, int8_t potencia_dbm, radio_diag_t *diag);
+bool        radio_dormir(void);                  /* sleep conservando la configuracion   */
+bool        radio_despertar(void);               /* false: hay que repetir radio_init    */
+bool        radio_potencia(int8_t dbm);          /* -9..+22 dBm                          */
+bool        radio_canal(uint8_t canal);          /* 0..63 (ver salto.h)                  */
 
-/* Ayudas para imprimir (texto de cada paso, de cada error y de cada resultado) */
+bool        radio_tx_iniciar(const uint8_t *datos, uint8_t largo);
+bool        radio_rx_iniciar(uint32_t timeout_ms);
+radio_ev_t  radio_evento(radio_rx_t *pkt);       /* se consulta hasta que no sea NINGUNO */
+void        radio_abortar(void);                 /* corta TX/RX y queda en standby       */
+
+/* Ayudas para imprimir */
 const char *radio_paso_str(radio_paso_t paso);
-const char *radio_error_str(uint8_t bit);     /* bit 0..15; NULL si no se usa */
 const char *radio_modo_str(uint8_t estado);
-const char *radio_tx_str(radio_tx_res_t res);
 
 #endif /* RADIO_H */

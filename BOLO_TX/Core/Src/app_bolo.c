@@ -1,44 +1,70 @@
 /**
  * @file    app_bolo.c
- * @brief   Aplicacion del nodo BOLO_TX. Coordina los modulos; no conoce registros,
- *          no arma textos y no sabe como se duerme: cada tarea la delega.
+ * @brief   Aplicacion del BOLO_TX, por eventos. Coordina los modulos; no conoce
+ *          registros ni arma textos.
+ *
+ *  El micro duerme en STOP2 y se despierta por:
+ *   - el tick de 1 s del RTC  -> grilla: cierre de epoca (20 s), medicion de
+ *                                temperatura (60 s), media de 10 min, periodo (6 h)
+ *                                y hora de contacto; refresco del watchdog
+ *   - el INT del MPU-6050     -> una muestra de aceleracion (5 Hz)
+ *   - el LPTIM1               -> fin de la medicion del SHT31 (16 ms)
+ *
+ *  Contactos (T12): en la ranura propia (2 min x ranura despues de cada limite de
+ *  6 h) + espera al azar de 0-20 s; hasta 3 intentos cada 4 min. Sin ranura:
+ *  primer contacto a 1-5 min del arranque y reintentos cada 1-3 min.
  */
 #include "app_bolo.h"
 #include "bolo_config.h"
 #include "bolo_types.h"
+#include "bolo_reloj.h"
+#include "bolo_power.h"
+#include "bolo_util.h"
+#include "bolo_packet.h"
 #include "sensor_acc.h"
 #include "sensor_temp.h"
 #include "motion.h"
-#include "thermal.h"
-#include "report.h"
+#include "periodo.h"
+#include "almacen.h"
+#include "contacto.h"
 #include "radio.h"
-#include "bolo_packet.h"
-#include "bolo_power.h"
+#include "report.h"
 #include <stdbool.h>
 #include <stddef.h>
-#include <stdio.h>      /* snprintf: arma el texto del PING */
+
+/* Una hora anterior a 2024-01-01 solo puede ser la del RTC recien encendido */
+#define BOLO_UNIX_MIN_VALIDA   1704067200U
 
 /* ===================== Variables privadas ===================== */
-static I2C_HandleTypeDef  *s_hi2c    = NULL;
-static SPI_HandleTypeDef  *s_hspi    = NULL;   /* para reiniciar la radio si no despierta */
-static IWDG_HandleTypeDef *s_hiwdg   = NULL;
-static uint32_t           s_ciclo   = 0;
-static bool               s_acc_ok  = false;
-static bool               s_temp_ok = false;
-static bool               s_radio_ok = false;   /* la radio quedo lista al arrancar */
-static uint8_t            s_reinicio = PKT_RST_DESCONOCIDA; /* viaja en cada paquete */
+static I2C_HandleTypeDef  *s_hi2c  = NULL;
+static SPI_HandleTypeDef  *s_hspi  = NULL;
+static IWDG_HandleTypeDef *s_hiwdg = NULL;
 
-/* El paquete usa los mismos numeros que los estados internos: si alguien los
- * cambia, esto deja de compilar en vez de mandar datos equivocados. */
-_Static_assert(BOLO_ESTADO_MOV_FUERTE == PKT_MOV_FUERTE && BOLO_ESTADO_DESCONOCIDO == PKT_MOV_DESCONOCIDO,
-               "bolo_estado_t y PKT_MOV_* tienen que coincidir");
-_Static_assert(TERM_SUBA == PKT_TERM_SUBA && TERM_SIN_DATO == PKT_TERM_SIN_DATO,
-               "term_estado_t y PKT_TERM_* tienen que coincidir");
+static bolo_persist_t s_p;                 /* espejo de los registros de backup */
+static bool     s_acc_ok   = false;
+static bool     s_temp_ok  = false;
+static bool     s_radio_ok = false;
+static uint8_t  s_causa    = RST_DESCONOCIDO;  /* va en el primer periodo despues del arranque */
 
-/* ===================== Funciones privadas ===================== */
+/* Grilla */
+static uint32_t s_seg       = 0U;          /* ultimo segundo procesado               */
+static uint32_t s_epoca_id  = 0U;          /* epoca en curso = t / 20                */
+static uint32_t s_th_idx    = 0U;          /* media de 10 min en curso (desde la marca) */
+static uint32_t s_periodo_id = 0U;         /* periodo en curso = t / T_PERIODO_S     */
+static uint32_t s_minuto_id = 0U;          /* ultimo minuto con medicion de temperatura */
+static bool     s_sht_midiendo = false;
+static uint32_t s_sht_t     = 0U;
+
+/* Contactos */
+static bool     s_en_contacto = false;
+static uint32_t s_t_contacto  = 0U;        /* hora del proximo contacto              */
+static uint32_t s_ciclo       = 0U;        /* bloque de 6 h del proximo contacto     */
+static uint8_t  s_intento     = 0U;        /* 0..2 dentro del ciclo                  */
+
+/* ===================== Auxiliares ===================== */
 static void led(bool encendido)
 {
-#if BOLO_LED_SENSADO
+#if BOLO_LED_CONTACTO
   HAL_GPIO_WritePin(LD3_GPIO_Port, LD3_Pin, encendido ? GPIO_PIN_SET : GPIO_PIN_RESET);
 #else
   (void)encendido;
@@ -53,134 +79,413 @@ static void escaneo_i2c(void)
 
   for (uint8_t addr = 1; addr < 128U && n < sizeof(dirs); addr++)
   {
-    if (HAL_I2C_IsDeviceReady(s_hi2c, (uint16_t)(addr << 1), 2, 10) == HAL_OK)
-    {
-      dirs[n++] = addr;
-    }
+    if (HAL_I2C_IsDeviceReady(s_hi2c, (uint16_t)(addr << 1), 2, 10) == HAL_OK) dirs[n++] = addr;
   }
   report_i2c(dirs, n);
 }
 #endif
 
-/* Destraba el bus I2C y reinicia el periferico.
- * Si un sensor se quedo a mitad de un byte (por ejemplo, perdio y recupero la
- * alimentacion), puede quedar sosteniendo SDA en bajo y el bus queda "trabado".
- * Remedio estandar: hasta 9 pulsos de reloj en SCL para que termine de soltar
- * el byte, una condicion STOP, y despues el periferico arranca de cero. */
+/* Destraba el bus I2C y reinicia el periferico: hasta 9 pulsos en SCL para que un
+ * sensor a mitad de byte suelte SDA, una condicion STOP, y el periferico de cero. */
 static void i2c_recuperar(void)
 {
   GPIO_InitTypeDef g = {0};
 
-  HAL_I2C_DeInit(s_hi2c);                       /* suelta los pines (MspDeInit) */
+  HAL_I2C_DeInit(s_hi2c);
 
   HAL_GPIO_WritePin(BOLO_I2C_PORT, BOLO_I2C_SCL_PIN | BOLO_I2C_SDA_PIN, GPIO_PIN_SET);
   g.Pin   = BOLO_I2C_SCL_PIN | BOLO_I2C_SDA_PIN;
-  g.Mode  = GPIO_MODE_OUTPUT_OD;                /* drenador abierto, como el bus */
-  g.Pull  = GPIO_NOPULL;                        /* los pull-up estan en los modulos */
+  g.Mode  = GPIO_MODE_OUTPUT_OD;
+  g.Pull  = GPIO_NOPULL;
   g.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(BOLO_I2C_PORT, &g);
 
-  for (uint8_t k = 0; k < 9U; k++)              /* ~10 us por medio ciclo: <100 kHz */
+  for (uint8_t k = 0; k < 9U; k++)
   {
     HAL_GPIO_WritePin(BOLO_I2C_PORT, BOLO_I2C_SCL_PIN, GPIO_PIN_RESET);
     for (volatile uint32_t d = 0; d < 50U; d++) { }
     HAL_GPIO_WritePin(BOLO_I2C_PORT, BOLO_I2C_SCL_PIN, GPIO_PIN_SET);
     for (volatile uint32_t d = 0; d < 50U; d++) { }
   }
-
-  /* STOP: SDA sube mientras SCL esta en alto */
   HAL_GPIO_WritePin(BOLO_I2C_PORT, BOLO_I2C_SDA_PIN, GPIO_PIN_RESET);
   for (volatile uint32_t d = 0; d < 50U; d++) { }
   HAL_GPIO_WritePin(BOLO_I2C_PORT, BOLO_I2C_SDA_PIN, GPIO_PIN_SET);
 
-  HAL_I2C_Init(s_hi2c);                         /* MspInit vuelve a poner los pines en I2C */
+  HAL_I2C_Init(s_hi2c);
 }
 
-/* Lee por que arranco el micro y deja todo limpio para el proximo reinicio.
- * Orden importante: un HardFault y una carga desde CubeIDE usan los dos el reset
- * por software; lo que los distingue es la marca en el registro de backup. */
+/* Por que arranco el micro. Un HardFault y una carga desde CubeIDE usan los dos el
+ * reset por software; los distingue la marca en el registro de backup. */
 static const char *causa_reinicio(bool *anomalo)
 {
   const char *c;
   *anomalo = true;
 
-  if (RTC->BKP0R == BOLO_MARCA_HARDFAULT)        { c = "HARDFAULT";                       s_reinicio = PKT_RST_HARDFAULT; }
-  else if (__HAL_RCC_GET_FLAG(RCC_FLAG_IWDGRST)) { c = "WATCHDOG (el programa se trabo)"; s_reinicio = PKT_RST_WATCHDOG;  }
+  if (RTC->BKP0R == BOLO_MARCA_HARDFAULT)        { c = "HARDFAULT";                          s_causa = RST_HARDFAULT; }
+  else if (__HAL_RCC_GET_FLAG(RCC_FLAG_IWDGRST)) { c = "WATCHDOG (el programa se trabo)";    s_causa = RST_WATCHDOG;  }
   else
   {
     *anomalo = false;
-    if      (__HAL_RCC_GET_FLAG(RCC_FLAG_BORRST)) { c = "encendido (o caida de tension)";     s_reinicio = PKT_RST_ENCENDIDO; }
-    else if (__HAL_RCC_GET_FLAG(RCC_FLAG_SFTRST)) { c = "por software (carga desde CubeIDE)"; s_reinicio = PKT_RST_SOFTWARE;  }
-    else if (__HAL_RCC_GET_FLAG(RCC_FLAG_PINRST)) { c = "boton de reset";                     s_reinicio = PKT_RST_BOTON;     }
-    else                                          { c = "desconocida";                        s_reinicio = PKT_RST_DESCONOCIDA; }
+    if      (__HAL_RCC_GET_FLAG(RCC_FLAG_BORRST)) { c = "encendido (o caida de tension)";     s_causa = RST_ENCENDIDO; }
+    else if (__HAL_RCC_GET_FLAG(RCC_FLAG_SFTRST)) { c = "por software (carga desde CubeIDE)"; s_causa = RST_SOFTWARE;  }
+    else if (__HAL_RCC_GET_FLAG(RCC_FLAG_PINRST)) { c = "boton de reset";                     s_causa = RST_BOTON;     }
+    else                                          { c = "desconocida";                        s_causa = RST_DESCONOCIDO; }
   }
 
-  RTC->BKP0R = 0U;                 /* se borra la marca (acceso habilitado en SystemClock_Config) */
-  __HAL_RCC_CLEAR_RESET_FLAGS();   /* las banderas se acumulan si no se borran */
+  RTC->BKP0R = 0U;
+  __HAL_RCC_CLEAR_RESET_FLAGS();
   return c;
 }
 
-/* g -> decimas de mg, redondeado y limitado a lo que entra en 16 bits */
-static uint16_t a_dmg(float g)
-{
-  float v = g * 10000.0f + 0.5f;
-  if (v < 0.0f)     v = 0.0f;
-  if (v > 65535.0f) v = 65535.0f;
-  return (uint16_t)v;
-}
-
-/* Pasa los datos del ciclo a las unidades del paquete (ver bolo_packet.h) */
-static void armar_paquete(const bolo_data_t *d, bolo_pkt_t *p)
-{
-  *p = (bolo_pkt_t){ 0 };
-
-  p->nodo            = BOLO_NODO_ID;
-  p->seq             = (uint16_t)d->ciclo;
-  p->mov             = (uint8_t)d->estado;
-  p->term            = (uint8_t)d->term_estado;
-  p->temp_ok         = d->temp_ok;
-  p->ventana_cortada = d->ventana_cortada;
-  p->bus_recuperado  = d->bus_recuperado;
-  p->reinicio        = s_reinicio;
-
-  p->desvio_ejes_dmg = a_dmg(d->desvio_max);
-  p->desvio_mag_dmg  = a_dmg(d->desvio_mag);
-
-  if (d->temp_ok)
-  {
-    uint32_t h = ((uint32_t)d->hum_centi + 50U) / 100U;   /* centesimas de % -> % */
-    p->temp_centi  = d->temp_centi;
-    p->delta_centi = d->temp_delta_centi;
-    p->hum_pct     = (uint8_t)((h > 100U) ? 100U : h);
-  }
-
-  p->evento_fin = (d->term_fin_tipo == TERM_BAJADA || d->term_fin_tipo == TERM_SUBA);
-  if (p->evento_fin)
-  {
-    p->evento_suba      = (d->term_fin_tipo == TERM_SUBA);
-    p->ev_ciclos        = (uint8_t)((d->term_fin_ciclos > 255U) ? 255U : d->term_fin_ciclos);
-    p->ev_extremo_centi = d->term_fin_extremo_centi;
-  }
-}
-
-/* Dispara una medicion de temperatura. Si el sensor no responde, queda marcado
- * para reiniciarse y se avisa que hay que destrabar el bus. */
-static bool temp_disparar(bool *falla_bus)
-{
-  if (temp_start()) return true;
-  s_temp_ok  = false;
-  *falla_bus = true;
-  return false;
-}
-
-/* Encendido completo de la radio (TCXO, calibracion y configuracion LoRa) e informe */
-static bool radio_probar(SPI_HandleTypeDef *hspi)
+static bool radio_probar(void)
 {
   radio_diag_t diag;
-  bool ok = radio_init(hspi, &diag);
-
+  bool ok = radio_init(s_hspi, s_p.potencia_dbm, &diag);
   report_radio(&diag);
+  if (ok) (void)radio_dormir();
   return ok;
+}
+
+/* ===================== Periodos ===================== */
+static void abrir_periodo(uint32_t marca)
+{
+  periodo_abrir(marca, !s_p.hora_sincronizada, s_causa);
+  s_causa      = RST_NINGUNO;
+  s_periodo_id = marca / T_PERIODO_S;
+  s_epoca_id   = marca / T_EPOCA_S;
+  s_th_idx     = 0U;
+  motion_reset();
+}
+
+/* Cierra el periodo en armado y lo guarda.
+ * completo: termino la grilla de 6 h -> se completan con "sin dato" las epocas y
+ *           medias que falten hasta el final (la grilla queda exacta).
+ * parcial : (arranque, salto de hora) se guarda lo que haya. */
+static void cerrar_periodo(bool completo)
+{
+  if (!periodo_abierto()) return;
+
+  if (completo)
+  {
+    uint32_t fin   = (s_periodo_id + 1U) * T_PERIODO_S;
+    uint32_t marca = periodo_marca();
+    uint32_t esp_ep = (fin > marca) ? (fin - marca) / T_EPOCA_S : 0U;
+    uint32_t esp_th = (fin > marca) ? (fin - marca + T_MEDIA_TH_S - 1U) / T_MEDIA_TH_S : 0U;
+
+    while (periodo_n_th() < esp_th && periodo_cerrar_th()) { }
+    while (periodo_n_epocas() < esp_ep && periodo_epoca(NULL)) { }
+  }
+  else
+  {
+    if (periodo_th_pendiente()) (void)periodo_cerrar_th();
+    if (periodo_n_epocas() == 0U) { periodo_descartar(); return; }   /* < 20 s de datos */
+  }
+
+  uint16_t mv = vdd_medir_mv();
+  periodo_cierre_t c = { s_p.n_periodo, vdd_codigo(mv), s_p.sin_ack };
+  periodo_info_t   info;
+
+  periodo_cerrar(&c, &info);
+  s_p.n_periodo++;
+  persist_guardar(&s_p);
+  report_periodo(&info, mv, !completo);
+}
+
+/* Cierra la epoca en curso (aunque no hayan pasado los 20 s) */
+static void cerrar_epoca(void)
+{
+  epoca_t ep;
+
+  motion_epoca(&ep);
+  if (s_acc_ok && ep.n_muestras == 0U) s_acc_ok = false;   /* no llegan avisos: se reconfigura */
+  (void)periodo_epoca(&ep);
+  report_epoca(s_epoca_id * T_EPOCA_S, &ep);
+  motion_reset();
+
+  /* El acelerometro que fallo se reintenta una vez por epoca */
+  if (!s_acc_ok)
+  {
+    periodo_falla_acc();
+    s_acc_ok = acc_init(s_hi2c);
+    if (!s_acc_ok) i2c_recuperar();
+  }
+}
+
+/* ===================== Sensores ===================== */
+static void iniciar_sht(uint32_t t)
+{
+  if (!s_temp_ok)
+  {
+    s_temp_ok = temp_init(s_hi2c);
+    if (!s_temp_ok)
+    {
+      periodo_falla_temp();
+      i2c_recuperar();
+      report_th(t, false, 0, 0U);
+      return;
+    }
+  }
+
+  if (temp_start())
+  {
+    s_sht_midiendo = true;
+    s_sht_t        = t;
+    power_lptim_iniciar(TEMP_T_MEDICION_MS);   /* 16 ms en STOP2 */
+  }
+  else
+  {
+    s_temp_ok = false;
+    periodo_falla_temp();
+    i2c_recuperar();
+  }
+}
+
+static void leer_sht(void)
+{
+  int16_t  t_c;
+  uint16_t h_c;
+
+  if (!s_sht_midiendo) return;
+  s_sht_midiendo = false;
+
+  if (temp_read(&t_c, &h_c))
+  {
+    periodo_muestra_th(t_c, h_c);
+    report_th(s_sht_t, true, t_c, h_c);
+  }
+  else
+  {
+    s_temp_ok = false;
+    periodo_falla_temp();
+    i2c_recuperar();
+    report_th(s_sht_t, false, 0, 0U);
+  }
+}
+
+static void leer_mpu(void)
+{
+  acc_raw_t m;
+
+  if (!s_acc_ok) return;
+  if (acc_read(&m))                          /* leer tambien borra el aviso del INT */
+  {
+    motion_add(&m);
+  }
+  else
+  {
+    s_acc_ok = false;
+    i2c_recuperar();
+  }
+}
+
+/* ===================== Grilla ===================== */
+static void procesar_tiempo(uint32_t t)
+{
+  if (t == s_seg) return;
+  s_seg = t;
+
+  if (!periodo_abierto()) abrir_periodo((t / T_EPOCA_S) * T_EPOCA_S);
+
+  /* ---- Epoca (20 s) y periodo (6 h) ---- */
+  uint32_t e = t / T_EPOCA_S;
+  if (e > s_epoca_id)
+  {
+    cerrar_epoca();
+
+    uint32_t p = t / T_PERIODO_S;
+    if (p > s_periodo_id)
+    {
+      cerrar_periodo(true);
+      abrir_periodo(p * T_PERIODO_S);
+    }
+    else
+    {
+      /* Epocas salteadas (el micro estuvo ocupado o la hora salto un poco) */
+      for (uint32_t k = s_epoca_id + 1U; k < e; k++) (void)periodo_epoca(NULL);
+    }
+    s_epoca_id = e;
+  }
+
+  /* ---- Media de temperatura y humedad (10 min) ---- */
+  uint32_t marca = periodo_marca();
+  if (t >= marca)
+  {
+    uint32_t j = (t - marca) / T_MEDIA_TH_S;
+    if (j > s_th_idx)
+    {
+      for (uint32_t k = s_th_idx; k < j; k++) (void)periodo_cerrar_th();
+      s_th_idx = j;
+      periodo_respaldar();                   /* foto del periodo cada 10 min */
+    }
+  }
+
+  /* ---- Temperatura (cada 60 s) ---- */
+  uint32_t mi = t / T_SHT_S;
+  if (mi > s_minuto_id && !s_sht_midiendo)
+  {
+    s_minuto_id = mi;
+    iniciar_sht(t);
+  }
+}
+
+/* Se llama en cada despertar, y tambien durante los contactos */
+static void servicio(void)
+{
+  HAL_IWDG_Refresh(s_hiwdg);
+  (void)reloj_tick();
+  procesar_tiempo(reloj_ahora());
+  if (power_mpu_avisos() > 0U) leer_mpu();
+  if (power_lptim_vencio())    leer_sht();
+}
+
+/* ===================== Hora de la gateway ===================== */
+static void aplicar_hora(uint32_t gw)
+{
+  if (gw < 946684800U) return;                       /* 0 o invalida: no se toca */
+
+  bool    primera = !s_p.hora_sincronizada;
+  int32_t d       = (int32_t)(gw - reloj_ahora());
+
+  if (primera || d > (int32_t)BOLO_SALTO_HORA_MAX_S || d < -(int32_t)BOLO_SALTO_HORA_MAX_S)
+  {
+    /* Salto grande (o primera hora): el periodo en curso se cierra como parcial y
+     * se arranca otro en la grilla nueva. Los periodos cerrados sin hora se corrigen. */
+    cerrar_epoca();
+    cerrar_periodo(false);
+    d = reloj_fijar(gw);
+    if (primera) almacen_reestampar(d);
+    s_p.hora_sincronizada = true;
+    persist_guardar(&s_p);
+
+    uint32_t t = reloj_ahora();
+    abrir_periodo((t / T_EPOCA_S) * T_EPOCA_S);
+    s_seg       = t;
+    s_minuto_id = t / T_SHT_S;
+  }
+  else
+  {
+    /* Deriva chica: se absorbe (si adelanta, las epocas salteadas van como invalidas;
+     * si atrasa, la epoca en curso dura un poco mas) */
+    d = reloj_fijar(gw);
+  }
+  report_hora(gw, d, primera);
+}
+
+/* ===================== Contactos ===================== */
+static void planificar(void)
+{
+  uint32_t ahora = reloj_ahora();
+
+  if (!s_p.ranura_valida)
+  {
+    s_t_contacto = ahora + azar_rango(T_REINTENTO_MIN_S, T_REINTENTO_MAX_S);
+    report_proximo(ahora, s_t_contacto);
+    return;
+  }
+
+  /* Si el ciclo previsto quedo muy atras o muy adelante (arranque, salto de hora
+   * en cualquier sentido), se reubica en la grilla actual */
+  if ((uint64_t)s_ciclo * T_PERIODO_S + T_PERIODO_S < ahora)
+  {
+    s_ciclo   = ahora / T_PERIODO_S;
+    s_intento = 0U;
+  }
+  else if (s_ciclo > ahora / T_PERIODO_S + 1U)
+  {
+    s_ciclo   = ahora / T_PERIODO_S + 1U;
+    s_intento = 0U;
+  }
+
+  for (;;)
+  {
+    uint32_t base = s_ciclo * T_PERIODO_S +
+                    ((uint32_t)s_p.ranura + CONT_SEPARACION_RANURAS * s_intento) * T_RANURA_S;
+    if (base + T_ESPERA_HOLA_MAX_S > ahora)
+    {
+      uint32_t t = base + azar_rango(0U, T_ESPERA_HOLA_MAX_S);   /* espera al azar 0-20 s */
+      s_t_contacto = (t > ahora) ? t : ahora + 1U;
+      break;
+    }
+    /* Ese intento ya paso: el siguiente */
+    if (++s_intento >= CONT_INTENTOS) { s_intento = 0U; s_ciclo++; }
+  }
+  report_proximo(ahora, s_t_contacto);
+}
+
+static void hacer_contacto(void)
+{
+  cont_res_t r;
+  bool pide = !s_p.ranura_valida;
+
+  s_en_contacto = true;
+  s_p.contacto++;
+  persist_guardar(&s_p);
+  report_contacto_inicio(s_p.contacto, s_intento, pide);
+
+  if (!s_radio_ok) s_radio_ok = radio_probar();
+
+  if (s_radio_ok)
+  {
+    led(true);
+    contacto_ejecutar(BOLO_NODO_ID, s_p.contacto, pide, servicio, &r);
+    led(false);
+    report_contacto_fin(&r);
+    if (r.estado == CONT_FALLA_RADIO) s_radio_ok = radio_probar();   /* reconfigurar de cero */
+  }
+  else
+  {
+    r = (cont_res_t){ 0 };
+    r.estado = CONT_FALLA_RADIO;
+  }
+
+  if (r.estado == CONT_OK)
+  {
+    bool ranura_nueva = false;
+
+    /* Con cada ACK: hora de la gateway y comando */
+    aplicar_hora(r.hora_gw);
+    s_p.sin_ack = 0U;
+
+    if (r.comando == PKT_CMD_RANURA && r.argumento < RANURAS_POR_PERIODO)
+    {
+      ranura_nueva      = !s_p.ranura_valida || s_p.ranura != r.argumento;
+      s_p.ranura        = r.argumento;
+      s_p.ranura_valida = true;
+      if (ranura_nueva) report_ranura(s_p.ranura);
+    }
+    else if (r.comando == PKT_CMD_POTENCIA)
+    {
+      int8_t dbm = (int8_t)r.argumento;
+      if (dbm >= -9 && dbm <= 22 && dbm != s_p.potencia_dbm)
+      {
+        s_p.potencia_dbm = dbm;
+        if (radio_despertar() && radio_potencia(dbm)) report_potencia(dbm);
+        (void)radio_dormir();
+      }
+    }
+
+    /* El proximo contacto es en el ciclo siguiente. Con una ranura recien
+     * asignada se cuenta desde ahora (los datos acaban de salir). */
+    if (s_p.ranura_valida)
+    {
+      s_ciclo   = ranura_nueva ? (reloj_ahora() / T_PERIODO_S + 1U) : (s_ciclo + 1U);
+      s_intento = 0U;
+    }
+  }
+  else if (s_p.ranura_valida)
+  {
+    /* Hasta 3 intentos por ciclo; si fallan los 3, los datos quedan guardados */
+    if (++s_intento >= CONT_INTENTOS)
+    {
+      s_intento = 0U;
+      s_ciclo++;
+      if (s_p.sin_ack < 0xFFU) s_p.sin_ack++;
+    }
+  }
+
+  persist_guardar(&s_p);
+  planificar();
+  s_en_contacto = false;
 }
 
 /* ===================== Funciones publicas ===================== */
@@ -188,198 +493,85 @@ void app_init(I2C_HandleTypeDef *hi2c, UART_HandleTypeDef *huart, RTC_HandleType
               IWDG_HandleTypeDef *hiwdg, SPI_HandleTypeDef *hspi)
 {
   bool anomalo;
+  alm_estado_t est;
 
   s_hi2c  = hi2c;
   s_hiwdg = hiwdg;   /* el IWDG ya esta corriendo: lo arranco MX_IWDG_Init() */
   s_hspi  = hspi;
-  power_init(hrtc, huart);   /* reposo en STOP2 con el RTC como despertador */
 
 #ifdef DEBUG
-  /* Con el debugger en pausa el watchdog tambien se pausa (si no, resetea a los 25 s) */
-  __HAL_DBGMCU_FREEZE_IWDG();
+  __HAL_DBGMCU_FREEZE_IWDG();   /* con el debugger en pausa el watchdog tambien se pausa */
 #endif
 
-  thermal_reset();     /* la base termica se aprende desde la primera medicion */
+  power_init(huart);
+  reloj_init(hrtc);
 
   report_init(huart);
   report_banner();
   const char *causa = causa_reinicio(&anomalo);
   report_reinicio(causa, anomalo);
 
+  persist_leer(&s_p);
+  if (reloj_ahora() < BOLO_UNIX_MIN_VALIDA)
+  {
+    /* El RTC perdio la hora (volvio a 2000-01-01): la hora y la ranura ya no valen */
+    s_p.hora_sincronizada = false;
+    s_p.ranura_valida     = false;
+  }
+
+  /* El CRC valida lo que quedo en RAM: primero se prueba la unidad por hardware */
+  report_crc(crc32_autotest());
+
+  /* Lo que quedo en RAM de antes del reset */
+  almacen_init();
+  bool recuperado = periodo_recuperar();
+  if (recuperado)
+  {
+    uint8_t causa_nueva = s_causa;
+    cerrar_periodo(false);                /* el periodo interrumpido, como parcial */
+    s_causa = causa_nueva;
+  }
+  almacen_estado(&est);
+  report_almacen(&est, recuperado);
+
 #if BOLO_DIAG_I2C
   escaneo_i2c();
 #endif
 
   s_acc_ok = acc_init(hi2c);
-  report_init_sensor(ACC_NOMBRE, s_acc_ok, acc_id());
-
+  report_sensor(ACC_NOMBRE, s_acc_ok, acc_id());
   s_temp_ok = temp_init(hi2c);
-  report_init_sensor(TEMP_NOMBRE, s_temp_ok, s_temp_ok ? TEMP_I2C_ADDR : 0U);
+  report_sensor(TEMP_NOMBRE, s_temp_ok, s_temp_ok ? TEMP_I2C_ADDR : 0U);
 
-  s_radio_ok = radio_probar(hspi);   /* si falla, el bolo sigue midiendo igual */
-  if (s_radio_ok) (void)radio_dormir();   /* duerme hasta la primera transmision */
+  s_radio_ok = radio_probar();            /* si falla, el bolo sigue midiendo igual */
+
+  azar_semilla(reloj_ahora() ^ RTC->SSR ^ (HAL_GetTick() << 16));
+
+  /* Primer periodo: arranca en la epoca actual (parcial) */
+  uint32_t t = reloj_ahora();
+  abrir_periodo((t / T_EPOCA_S) * T_EPOCA_S);
+  s_seg       = t;
+  s_minuto_id = t / T_SHT_S;
+
+  /* Primer contacto */
+  if (s_p.ranura_valida)
+  {
+    s_ciclo   = t / T_PERIODO_S;
+    s_intento = 0U;
+    planificar();
+  }
+  else
+  {
+    s_t_contacto = t + azar_rango(T_ARRANQUE_MIN_S, T_ARRANQUE_MAX_S);
+    report_proximo(t, s_t_contacto);
+  }
 }
-
 
 void app_run(void)
 {
-  bolo_data_t datos = {0};      /* estado arranca en DESCONOCIDO */
-  acc_raw_t   m;
-  bool        falla_bus = false;  /* algo fallo en el I2C este ciclo -> destrabar al final */
+  servicio();
 
-  /* Unico lugar donde se refresca el watchdog: si el ciclo se traba en cualquier
-   * punto, no se vuelve a llegar aca y el IWDG resetea el micro. */
-  HAL_IWDG_Refresh(s_hiwdg);
+  if (!s_en_contacto && (int32_t)(reloj_ahora() - s_t_contacto) >= 0) hacer_contacto();
 
-  /* Encabezado del ciclo primero: los avisos de reintento quedan adentro del ciclo */
-  report_sensando(s_ciclo);
-
-#if (BOLO_PRUEBA_FALLA != 0)
-  if (s_ciclo == 3U)
-  {
-    report_prueba_falla(BOLO_PRUEBA_FALLA);
-    led(true);
-  #if (BOLO_PRUEBA_FALLA == 1)
-    while (1) { }                 /* cuelgue: nadie refresca el watchdog */
-  #else
-    __builtin_trap();             /* instruccion invalida -> HardFault */
-  #endif
-  }
-#endif
-
-  /* Si el acelerometro no inicializo (o fallo el ciclo anterior), se reintenta */
-  if (!s_acc_ok)
-  {
-    s_acc_ok = acc_init(s_hi2c);
-    report_init_sensor(ACC_NOMBRE, s_acc_ok, acc_id());
-    if (!s_acc_ok) falla_bus = true;
-  }
-
-  /* Igual con el sensor de temperatura */
-  if (!s_temp_ok)
-  {
-    s_temp_ok = temp_init(s_hi2c);
-    report_init_sensor(TEMP_NOMBRE, s_temp_ok, s_temp_ok ? TEMP_I2C_ADDR : 0U);
-    if (!s_temp_ok) falla_bus = true;
-  }
-
-  /* ---------- SENSAR ---------- */
-  led(true);
-  acc_wake();
-  motion_reset(ACC_CUENTAS_POR_G);
-
-  bool     temp_midiendo = false;
-  uint32_t t0       = HAL_GetTick();
-  uint32_t t        = t0;
-  uint8_t  seguidas = 0;                                /* fallas consecutivas */
-
-  for (uint32_t i = 0; i < ACC_N_MUESTRAS; i++)
-  {
-    power_esperar_desde(t, ACC_PERIODO_MS);            /* SLEEP hasta la proxima muestra */
-    t += ACC_PERIODO_MS;                                /* turno contado desde el inicio */
-
-    if (acc_read(&m))
-    {
-      motion_add(&m);
-      seguidas = 0;
-    }
-    else
-    {
-      datos.error_sensor = true;
-      datos.fallas_lectura++;
-      if (++seguidas >= ACC_FALLAS_MAX) { datos.ventana_cortada = true; break; }
-    }
-
-    /* Cerca del final de la ventana se dispara la temperatura: el SHT31 mide solo
-     * (~12,5 ms) mientras el acelerometro toma la ultima muestra */
-    if (i == TEMP_INICIO_MUESTRA && s_temp_ok) temp_midiendo = temp_disparar(&falla_bus);
-
-    /* Tope de tiempo: pase lo que pase, la ventana no se estira mas de 6 s */
-    if ((HAL_GetTick() - t0) > VENTANA_MAX_MS) { datos.ventana_cortada = true; break; }
-  }
-  datos.ventana_ms = (uint16_t)(HAL_GetTick() - t0);
-
-  /* Si la ventana se corto antes de disparar la temperatura, se mide igual:
-   * que falle el acelerometro no tiene por que dejarnos sin temperatura */
-  if (s_temp_ok && !temp_midiendo)
-  {
-    temp_midiendo = temp_disparar(&falla_bus);
-    if (temp_midiendo) HAL_Delay(TEMP_T_MEDICION_MS);
-  }
-
-  acc_sleep();
-  led(false);
-
-  if (datos.fallas_lectura > 0U)
-  {
-    s_acc_ok  = false;          /* pudo perder la alimentacion: se reconfigura entero */
-    falla_bus = true;
-  }
-
-  /* La medicion de temperatura ya termino: se lee el resultado */
-  if (temp_midiendo)
-  {
-    datos.temp_ok = temp_read(&datos.temp_centi, &datos.hum_centi);
-    if (!datos.temp_ok) { s_temp_ok = false; falla_bus = true; }
-  }
-
-  /* Si hubo fallas, el bus se destraba ahora; los sensores que fallaron se
-   * reinician al principio del proximo ciclo (sin resetear la placa). */
-  if (falla_bus)
-  {
-    i2c_recuperar();
-    datos.bus_recuperado = true;
-  }
-
-  /* ---------- PROCESAR ---------- */
-  datos.ciclo = s_ciclo++;
-  motion_compute(&datos);
-  thermal_update(&datos);
-  if (datos.ventana_cortada) datos.estado = BOLO_ESTADO_DESCONOCIDO;  /* dato incompleto */
-
-  /* ---------- REPORTAR ---------- */
-  report_resultado(&datos);
-
-  /* ---------- TRANSMITIR (etapa 3: los datos del ciclo, 18 bytes) ---------- */
-  if (s_radio_ok)
-  {
-    bolo_pkt_t pkt;
-    uint8_t    buf[PKT_LARGO_V1];
-    char       msg[24];
-    radio_tx_t tx;
-
-    armar_paquete(&datos, &pkt);
-    uint8_t n = bolo_pkt_encode(&pkt, buf);
-
-    /* La radio paso el reposo dormida. Si no despierta bien, se rehace la
-     * configuracion completa (radio_probar informa el resultado como al arrancar). */
-    if (!radio_despertar())
-    {
-      s_radio_ok = radio_probar(s_hspi);
-    }
-
-    if (s_radio_ok)
-    {
-      (void)snprintf(msg, sizeof(msg), "datos #%u, %u B", (unsigned)pkt.seq, (unsigned)n);
-      bool enviado = radio_send(buf, n, &tx);
-      report_radio_tx(msg, &tx);
-
-      /* Si fallo despues de dormir, se reconfigura la radio y se intenta una vez mas */
-      if (!enviado)
-      {
-        s_radio_ok = radio_probar(s_hspi);
-        if (s_radio_ok)
-        {
-          (void)radio_send(buf, n, &tx);
-          report_radio_tx(msg, &tx);
-        }
-      }
-
-      if (s_radio_ok) (void)radio_dormir();   /* hasta la proxima transmision: < 1 uA */
-    }
-  }
-
-  /* ---------- REPOSO ---------- */
-  report_durmiendo(T_REPOSO_S);
-  power_dormir_s(T_REPOSO_S);                           /* STOP2, lo despierta el RTC */
+  power_dormir();   /* STOP2 hasta el proximo tick, muestra o fin de medicion */
 }
