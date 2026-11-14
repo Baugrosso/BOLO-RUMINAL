@@ -28,6 +28,8 @@
 #define OP_READ_BUFFER          0x1EU
 #define OP_GET_DEVICE_ERRORS    0x17U
 #define OP_READ_REGISTER        0x1DU
+#define OP_WRITE_REGISTER       0x0DU
+#define OP_SET_FALLBACK         0x93U
 #define OP_SET_STANDBY          0x80U
 #define OP_SET_RX               0x82U
 #define OP_SET_SLEEP            0x84U
@@ -147,6 +149,27 @@ sx_status_t sx1262_read_register(uint16_t addr, uint8_t *buf, uint8_t n)
   sx_status_t r = transferir(tx, rx, (uint16_t)(4U + n));
   for (uint8_t i = 0; i < n; i++) buf[i] = rx[4U + i];
   return r;
+}
+
+/* WriteRegister: [0x0D, dir_alta, dir_baja, datos...] */
+sx_status_t sx1262_write_register(uint16_t addr, const uint8_t *buf, uint8_t n)
+{
+  uint8_t tx[3U + SX_MAX_LECTURA] = { 0 };
+  uint8_t rx[3U + SX_MAX_LECTURA] = { 0 };
+
+  if (buf == NULL || n == 0U || n > SX_MAX_LECTURA) return SX_ERR_PARAM;
+
+  tx[0] = OP_WRITE_REGISTER;
+  tx[1] = (uint8_t)(addr >> 8);
+  tx[2] = (uint8_t)(addr & 0xFFU);
+  for (uint8_t i = 0; i < n; i++) tx[3U + i] = buf[i];
+  return transferir(tx, rx, (uint16_t)(3U + n));
+}
+
+/* SetRxTxFallbackMode [0x93, modo]: a que modo vuelve el chip al terminar TX o RX */
+sx_status_t sx1262_set_fallback(uint8_t modo)
+{
+  return comando(OP_SET_FALLBACK, &modo, 1U);
 }
 
 /* ===================== Etapa 2a ===================== */

@@ -1,141 +1,156 @@
 /**
  * @file    bolo_config.h
- * @brief   Parámetros de configuración del prototipo BOLO_TX.
- *          Todo valor ajustable del sistema vive acá y solo acá.
+ * @brief   Parametros de configuracion del BOLO_TX (prototipo, primera iteracion).
+ *          Todo valor ajustable del sistema vive aca y solo aca.
+ *
+ *  Fuente de verdad: "Requisitos de firmware y comunicacion del bolo" (2026-11-14).
+ *  Criterio general: el bolo NO clasifica. Manda lo mas crudo que entre y toda la
+ *  interpretacion (movimiento, toma de agua) se hace en la gateway / servidor.
  */
 #ifndef BOLO_CONFIG_H
 #define BOLO_CONFIG_H
 
-/* =========================================================
- *  1. MODO DE FUNCIONAMIENTO
- * ========================================================= */
-#define BOLO_MODO_DEMO     1   /* Ciclos cortos: para mostrar en vivo        */
-#define BOLO_MODO_PRUEBA   2   /* Ciclos de banco: desarrollo y pruebas      */
-
-#define BOLO_MODO          BOLO_MODO_PRUEBA   /* <-- se cambia SOLO esta línea */
+#include <stdint.h>
 
 /* =========================================================
- *  2. VENTANAS DE TIEMPO DEL CICLO
+ *  1. IDENTIDAD
  * ========================================================= */
-#if   (BOLO_MODO == BOLO_MODO_DEMO)
-  #define T_REPOSO_S        5U    /* segundos durmiendo  */
-  #define T_SENSADO_S       5U    /* segundos midiendo   */
-#elif (BOLO_MODO == BOLO_MODO_PRUEBA)
-  #define T_REPOSO_S        10U
-  #define T_SENSADO_S       5U
+#define BOLO_NODO_ID            1U      /* 1..255. Esta iteracion: bolos 1 y 2 */
+
+/* =========================================================
+ *  2. MODO DE TIEMPOS
+ * ========================================================= */
+/* REAL : los tiempos del requisito (periodo de 6 h, ranuras de 2 min).
+ * BANCO: los mismos mecanismos con tiempos cortos para probar en la mesa
+ *        (periodo de 30 min, ranuras de 10 s). La gateway tiene que usar los
+ *        MISMOS valores: si no, no se encuentran. */
+#define BOLO_MODO_REAL          1
+#define BOLO_MODO_BANCO         2
+
+#define BOLO_MODO               BOLO_MODO_REAL   /* <-- se cambia SOLO esta linea */
+
+/* =========================================================
+ *  3. GRILLA DE TIEMPO (T5/T6)
+ * ========================================================= */
+#define T_EPOCA_S               20U     /* epoca de aceleracion (opcion B)          */
+#define T_SHT_S                 60U     /* una medicion de temperatura por minuto   */
+#define T_MEDIA_TH_S            600U    /* se manda la media de cada 10 min         */
+
+#if   (BOLO_MODO == BOLO_MODO_REAL)
+  #define T_PERIODO_S           21600U  /* 6 h: un periodo = lo que junta entre contactos */
+  #define T_RANURA_S            120U    /* ranuras de 2 min (0-179)                 */
+  #define T_ESPERA_HOLA_MAX_S   20U     /* espera al azar de 0-20 s antes del hola  */
+  #define T_ARRANQUE_MIN_S      60U     /* sin ranura: primer contacto a 1-5 min    */
+  #define T_ARRANQUE_MAX_S      300U
+  #define T_REINTENTO_MIN_S     60U     /* sin ranura: reintentos cada 1-3 min      */
+  #define T_REINTENTO_MAX_S     180U
+#elif (BOLO_MODO == BOLO_MODO_BANCO)
+  #define T_PERIODO_S           1800U
+  #define T_RANURA_S            10U
+  #define T_ESPERA_HOLA_MAX_S   3U
+  #define T_ARRANQUE_MIN_S      10U
+  #define T_ARRANQUE_MAX_S      30U
+  #define T_REINTENTO_MIN_S     10U
+  #define T_REINTENTO_MAX_S     20U
 #else
   #error "BOLO_MODO no valido"
 #endif
-#define T_CICLO_S          (T_REPOSO_S + T_SENSADO_S)   /* periodo entre mediciones */
+
+/* Derivados (no tocar) */
+#define EPOCAS_POR_PERIODO      (T_PERIODO_S / T_EPOCA_S)       /* REAL: 1080 */
+#define MEDIAS_TH_POR_PERIODO   (T_PERIODO_S / T_MEDIA_TH_S)    /* REAL: 36   */
+#define SHT_POR_MEDIA           (T_MEDIA_TH_S / T_SHT_S)        /* 10         */
+#define RANURAS_POR_PERIODO     (T_PERIODO_S / T_RANURA_S)      /* REAL: 180  */
+
+_Static_assert((T_PERIODO_S % T_MEDIA_TH_S) == 0U && (T_MEDIA_TH_S % T_SHT_S) == 0U &&
+               (T_PERIODO_S % T_EPOCA_S) == 0U && (T_SHT_S % T_EPOCA_S) == 0U,
+               "La grilla tiene que ser exacta (6 h / 10 min / 1 min / 20 s)");
+_Static_assert(EPOCAS_POR_PERIODO <= 4095U,   "Cant. de epocas: 12 bits en los metadatos");
+_Static_assert(MEDIAS_TH_POR_PERIODO <= 255U, "Cant. de temperaturas: 8 bits en los metadatos");
+_Static_assert(RANURAS_POR_PERIODO <= 256U,   "La ranura viaja en 8 bits (argumento del ACK)");
 
 /* =========================================================
- *  3. MUESTREO DEL ACELEROMETRO
+ *  4. ACELEROMETRO (MPU-6050, solo acelerometro)
  * ========================================================= */
-#define ACC_FS_HZ           25U                          /* muestras por segundo     */
-#define ACC_PERIODO_MS      (1000U / ACC_FS_HZ)          /* 40 ms entre muestras     */
-#define ACC_N_MUESTRAS      (ACC_FS_HZ * T_SENSADO_S)    /* 125 muestras por ventana */
+/* Low-power cycle a 5 Hz, +-2 g, giroscopo apagado. El MPU avisa cada muestra por
+ * su pin INT (plan A), cableado a PB1 (D6). */
+#define ACC_FS_HZ               5U
+#define ACC_MUESTRAS_EPOCA      (ACC_FS_HZ * T_EPOCA_S)          /* 100 */
+#define ACC_MIN_VALIDAS         50U     /* < 50 de 100 muestras -> epoca invalida */
+
+#define BOLO_MPU_INT_PORT       GPIOB
+#define BOLO_MPU_INT_PIN        GPIO_PIN_1      /* D6 */
+#define BOLO_MPU_INT_IRQn       EXTI1_IRQn
 
 /* =========================================================
- *  4. DETECCION DE MOVIMIENTO (3 niveles, 2 medidas)
+ *  5. TEMPERATURA (SHT31-D)
  * ========================================================= */
-/* Medida 1: mayor desvio de los ejes X/Y/Z -> "¿se movio?"  (rotacion o sacudida)
- * Medida 2: desvio de la magnitud |a|      -> "¿fue brusco?" (en una rotacion pura
- *                                             la magnitud se queda en 1 g)
- *   desvio_mag >= FUERTE            -> MOVIMIENTO FUERTE
- *   si no, desvio_ejes >= SUAVE     -> MOVIMIENTO SUAVE
- *   si no                           -> REPOSO
- * Valores en mili-g. SUAVE calibrado en banco (18/10/2026).
- * FUERTE: valor inicial, a calibrar con rotacion vs sacudida. */
-#define MOV_UMBRAL_SUAVE_MG    5U     /* sobre el desvio de los ejes    */
-#define MOV_UMBRAL_FUERTE_MG   50U    /* sobre el desvio de la magnitud */
-/* =========================================================
- *  5. INDICADORES Y DEPURACION (impactan en la bateria)
- * ========================================================= */
-#define BOLO_LED_SENSADO    1   /* 1 = LED encendido mientras mide (demo)    */
-#define BOLO_UART_DETALLE   1   /* 1 = imprime el reporte completo por UART  */
-#define BOLO_UART_COLOR     1   /* 1 = colores en PuTTY (0 si el log muestra simbolos raros) */
-#define BOLO_DIAG_I2C       1   /* 1 = escaneo del bus I2C al arrancar (diagnostico)          */
-/* =========================================================
- *  6. CHEQUEOS EN TIEMPO DE COMPILACION
- * ========================================================= */
-/* La FIFO del MPU-6050 tiene 1024 bytes y cada muestra (X,Y,Z) ocupa 6.
- * Lo verificamos ya, porque es la estrategia de bajo consumo que viene. */
-_Static_assert((ACC_N_MUESTRAS * 6U) <= 1024U,
-        "La ventana de sensado no entra en la FIFO del MPU-6050");
-/* =========================================================
- *  7. SENSOR DE TEMPERATURA (SHT31-D)
- * ========================================================= */
-#define TEMP_I2C_ADDR       0x44U   /* ADR a GND (0x45 si ADR esta en alto) */
-/* La medicion se dispara al FINAL de la ventana (despues de esta muestra), asi
- * representa lo que paso durante el sensado y no el instante en que se prende el LED.
- * Queda 1 turno (40 ms) hasta el final, y el SHT31 tarda como mucho 15 ms. */
-#define TEMP_INICIO_MUESTRA (ACC_N_MUESTRAS - 2U)
-_Static_assert(((ACC_N_MUESTRAS - 1U - TEMP_INICIO_MUESTRA) * ACC_PERIODO_MS) >= 15U,
-        "No queda tiempo para que el SHT31 termine de medir antes del final de la ventana");
-/* =========================================================
- *  8. ROBUSTEZ (que una falla de sensor no cuelgue el ciclo)
- * ========================================================= */
-#define VENTANA_MAX_MS      (T_SENSADO_S * 1000U + 1000U)  /* 6 s: tope de la ventana   */
-#define ACC_FALLAS_MAX      5U      /* lecturas fallidas SEGUIDAS para cortar la ventana  */
+#define TEMP_I2C_ADDR           0x44U   /* ADR a GND (0x45 si ADR en alto) */
+
 /* Pines del bus I2C1, para destrabarlo a mano si un sensor deja SDA en bajo */
-#define BOLO_I2C_PORT       GPIOB
-#define BOLO_I2C_SCL_PIN    GPIO_PIN_6     /* D5 */
-#define BOLO_I2C_SDA_PIN    GPIO_PIN_7     /* D4 */
+#define BOLO_I2C_PORT           GPIOB
+#define BOLO_I2C_SCL_PIN        GPIO_PIN_6     /* D5 */
+#define BOLO_I2C_SDA_PIN        GPIO_PIN_7     /* D4 */
+
 /* =========================================================
- *  9. WATCHDOG (IWDG) Y PRUEBAS DE FALLA
+ *  6. FORMATO DE DATOS (T6) y COMPRESION (T7)
  * ========================================================= */
-/* CubeMX: prescaler 256, reload 3124 -> (3124+1)*256/32000 = 25 s nominal.
- * El LSI no es preciso: en el peor caso el timeout baja a ~23 s. */
-#define IWDG_TIMEOUT_MIN_S  23U
-/* El watchdog se refresca una vez por ciclo: el ciclo entero (con margen para
- * reintentos e impresion) tiene que entrar en el timeout. Si subis T_REPOSO_S
- * (paso 4, reposos largos) esto deja de compilar a proposito. */
-_Static_assert((T_REPOSO_S + T_SENSADO_S + 3U) <= IWDG_TIMEOUT_MIN_S,
-        "El ciclo no entra en el watchdog: refrescarlo durante el reposo");
+#define FMT_VERSION             2U      /* version del formato del periodo (4 bits)  */
+#define FMT_TEMP_SIN_DATO       ((int16_t)0x8000)
+#define FMT_HUM_SIN_DATO        0xFFU
+#define FMT_DESVIO_INVALIDO     0xFFU   /* epoca con < 50 muestras                   */
+#define FMT_ACC_MAX_MG          2047    /* medias X/Y/Z: 12 bits con signo, 1 mg     */
+#define FMT_ACC_MIN_MG          (-2048)
+
+#define CMP_BLOQUE              32U     /* valores por bloque Rice */
+
+/* =========================================================
+ *  7. MEMORIA (T8): todo en RAM, se conserva en Stop 2
+ * ========================================================= */
+#define ALM_NUCLEO_BYTES        (8U * 1024U)    /* temperatura, humedad, metadatos */
+#define ALM_ACEL_BYTES          (40U * 1024U)   /* aceleracion                     */
+
+/* =========================================================
+ *  8. CONTACTO (T9-T12)
+ * ========================================================= */
+#define CONT_MAX_PERIODOS       4U      /* del mas nuevo al mas viejo                 */
+#define CONT_MAX_FRAG           128U    /* 128 fragmentos -> bitmap del ACK de 16 B   */
+#define CONT_RONDAS_REENVIO     2U
+#define CONT_MAX_REENVIOS       32U
+#define CONT_INTENTOS           3U      /* por ciclo, en las ranuras propias          */
+#define CONT_SEPARACION_RANURAS 2U      /* intentos cada 4 min = 2 ranuras            */
+
+/* =========================================================
+ *  9. RADIO
+ * ========================================================= */
+#define RADIO_POTENCIA_DBM      22      /* fijo durante todo el contacto (T11) */
+
+/* =========================================================
+ *  10. INDICADORES Y DEPURACION (impactan en la bateria)
+ * ========================================================= */
+/* 0 = mudo (consumo real) | 1 = eventos (periodos, contactos) | 2 = detalle (cada epoca y cada temperatura) */
+#define BOLO_LOG                1
+#define BOLO_UART_COLOR         1   /* 1 = colores en PuTTY                         */
+#define BOLO_LED_CONTACTO       1   /* 1 = LD3 encendido durante cada contacto      */
+#define BOLO_DIAG_I2C           1   /* 1 = escaneo del bus I2C al arrancar          */
+
+/* 1 = el debugger sigue conectado en STOP2 (cientos de uA mas). Para MEDIR, en 0. */
+#define BOLO_DBG_EN_STOP        0
+
+/* =========================================================
+ *  11. WATCHDOG (IWDG) y FALLAS
+ * ========================================================= */
+/* CubeMX: prescaler 256, reload 3124 -> 25 s nominal, ~23 s en el peor caso del LSI.
+ * Se refresca en cada tick de 1 s del RTC y en cada fragmento. */
+#define IWDG_TIMEOUT_MIN_S      23U
 
 /* Marca que deja el HardFault_Handler en un registro de backup del RTC antes de
  * resetear (sobrevive al reset): asi el arranque sabe que fue un HardFault. */
-#define BOLO_MARCA_HARDFAULT  0xBAD0FA17U
+#define BOLO_MARCA_HARDFAULT    0xBAD0FA17U
 
-/* Prueba de fallas a proposito (dejar en 0 en uso normal):
- * 0 = nada | 1 = cuelgue en el ciclo 3 (lo saca el watchdog) | 2 = HardFault en el ciclo 3 */
-#define BOLO_PRUEBA_FALLA   0
-/* =========================================================
- *  10. EVENTOS TERMICOS (thermal.c)
- * ========================================================= */
-/* Tiempos en SEGUNDOS: el codigo los pasa a ciclos segun T_CICLO_S. Para el bolo
- * final se ajustan estos valores (o T_CICLO_S) y nada mas.
- *   Referencia (bolos reales): una toma de agua baja ~2,3 C en promedio y la
- *   recuperacion mas lenta medida fue ~103 min (22,7 L de agua a 1,7 C). */
-#define TERM_TAU_BASE_S           240U  /* la base se acomoda en ~4 min (bolo final: ~2-3 h)   */
-#define TERM_EVENTO_MAX_S         600U  /* tope de un evento: 10 min    (bolo final: ~2-3 h)   */
-#define TERM_APRENDIZAJE_CICLOS   4U    /* mediciones promediadas para la base inicial          */
-#define TERM_UMBRAL_BAJADA_CENTI  100U  /* 1,00 C bajo la base -> BAJADA (posible toma de agua) */
-#define TERM_UMBRAL_SUBA_CENTI    100U  /* 1,00 C sobre la base -> SUBA. SOLO DEMO (soplido):
-                                         * la fiebre real sube en horas y esta base la seguiria;
-                                         * detectarla necesita una base de dias o un umbral
-                                         * absoluto. Queda como trabajo futuro. */
-#define TERM_HISTERESIS_CENTI     30U   /* BAJADA termina con delta > -0,30 C; SUBA con < +0,30 C */
-
-/* Derivados (no tocar) */
-#define TERM_N_BASE             ((TERM_TAU_BASE_S + T_CICLO_S / 2U) / T_CICLO_S)   /* PRUEBA: 16 */
-#define TERM_EVENTO_MAX_CICLOS  ((TERM_EVENTO_MAX_S + T_CICLO_S - 1U) / T_CICLO_S) /* PRUEBA: 40 */
-_Static_assert(TERM_N_BASE >= 2U,            "TERM_TAU_BASE_S muy corto para el periodo del ciclo");
-_Static_assert(TERM_EVENTO_MAX_CICLOS >= 2U, "TERM_EVENTO_MAX_S muy corto para el periodo del ciclo");
-_Static_assert(TERM_HISTERESIS_CENTI < TERM_UMBRAL_BAJADA_CENTI &&
-               TERM_HISTERESIS_CENTI < TERM_UMBRAL_SUBA_CENTI,
-        "La histeresis tiene que ser menor que los umbrales");
-/* =========================================================
- *  11. RADIO LoRa (los parametros de radio viven en radio.c, iguales en TX y RX)
- * ========================================================= */
-#define BOLO_NODO_ID        1U      /* identifica a este bolo en el paquete (1..255) */
-
-/* =========================================================
- *  12. AHORRO DE ENERGIA (bolo_power.c)
- * ========================================================= */
-/* 1 = el debugger sigue conectado mientras el micro duerme en STOP2 (comodo para
- *     depurar paso a paso, pero mantiene relojes prendidos: cientos de uA mas).
- * 0 = consumo real. Para MEDIR consumo, siempre en 0. */
-#define BOLO_DBG_EN_STOP    0
+/* Un ajuste de hora mas grande que esto (en cualquier sentido) cierra el periodo en
+ * curso como parcial y arranca uno nuevo en la grilla nueva. Los ajustes chicos
+ * (deriva del cristal) se absorben sin cortar nada. */
+#define BOLO_SALTO_HORA_MAX_S   60U
 
 #endif /* BOLO_CONFIG_H */

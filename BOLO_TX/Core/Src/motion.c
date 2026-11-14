@@ -1,107 +1,98 @@
 /**
  * @file    motion.c
- * @brief   Calcula media y desvio por eje y de la magnitud, y clasifica en
- *          REPOSO / MOVIMIENTO SUAVE / MOVIMIENTO FUERTE.
+ * @brief   Media por eje y desvio de la magnitud de una epoca de 20 s.
+ *          Los acumuladores se reinician cada 20 s (motion_reset).
  */
 #include "motion.h"
 #include "bolo_config.h"
-#include <math.h>     /* sqrtf, fmaxf */
+#include "sensor_acc.h"
+#include <math.h>     /* sqrtf, logf, lroundf */
 #include <stddef.h>   /* NULL */
 
-#define MIN_MUESTRAS_VALIDAS   (ACC_N_MUESTRAS / 2U)
+/* La magnitud se acumula en 1/16 de cuenta: mejora la resolucion del desvio sin
+ * salirse de los enteros (16 * 28378 cuentas maximas = 454 048 -> int32). */
+#define MAG_ESCALA        16
 
-#define UMBRAL_SUAVE_G    ((float)MOV_UMBRAL_SUAVE_MG  / 1000.0f)
-#define UMBRAL_FUERTE_G   ((float)MOV_UMBRAL_FUERTE_MG / 1000.0f)
+/* Codigo log del desvio: 0,1 mg .. 2000 mg en 254 pasos */
+#define DESV_MIN_MG       0.1f
+#define DESV_PASOS        254.0f
+#define DESV_RANGO        20000.0f      /* 2000 mg / 0,1 mg */
 
-/* ===================== Tipos y variables privadas ===================== */
-typedef struct
-{
-  int32_t suma;        /* Σx   */
-  int64_t suma_cuad;   /* Σx²  */
-} acum_t;
-
-static acum_t   s_x, s_y, s_z;   /* ejes                        */
-static acum_t   s_mag;           /* magnitud √(x² + y² + z²)    */
-static uint32_t s_n;
-static float    s_cuentas_por_g = 1.0f;
+/* ===================== Variables privadas ===================== */
+static int32_t  s_sx, s_sy, s_sz;     /* suma de cada eje [cuentas]          */
+static int64_t  s_sm, s_smm;          /* suma y suma de cuadrados de |a|*16  */
+static uint16_t s_n;
 
 /* ===================== Funciones privadas ===================== */
-static void acum_add(acum_t *a, int32_t v)
+static int16_t media_mg(int32_t suma, uint16_t n)
 {
-  a->suma      += v;
-  a->suma_cuad += (int64_t)v * v;
-}
-
-static void acum_stats(const acum_t *a, uint32_t n, float *media_g, float *desvio_g)
-{
-  int64_t num = (int64_t)n * a->suma_cuad - (int64_t)a->suma * a->suma;
-  if (num < 0) num = 0;
-
-  if (media_g  != NULL) *media_g  = ((float)a->suma / (float)n) / s_cuentas_por_g;
-  if (desvio_g != NULL) *desvio_g = (sqrtf((float)num) / (float)n) / s_cuentas_por_g;
+  /* cuentas -> mg: x * 1000 / 16384, redondeado al entero mas cercano */
+  float mg = ((float)suma / (float)n) * (1000.0f / (float)ACC_CUENTAS_POR_G);
+  long  r  = lroundf(mg);
+  if (r > FMT_ACC_MAX_MG) r = FMT_ACC_MAX_MG;
+  if (r < FMT_ACC_MIN_MG) r = FMT_ACC_MIN_MG;
+  return (int16_t)r;
 }
 
 /* ===================== Funciones publicas ===================== */
-void motion_reset(float cuentas_por_g)
+uint8_t motion_desvio_codigo(float sigma_mg)
 {
-  s_x = (acum_t){0};
-  s_y = (acum_t){0};
-  s_z = (acum_t){0};
-  s_mag = (acum_t){0};
+  if (!(sigma_mg > DESV_MIN_MG)) return 0U;          /* tambien atrapa NaN */
+  float c = logf(sigma_mg / DESV_MIN_MG) * (DESV_PASOS / logf(DESV_RANGO));
+  if (c >= DESV_PASOS) return (uint8_t)DESV_PASOS;
+  return (uint8_t)lroundf(c);
+}
+
+void motion_reset(void)
+{
+  s_sx = s_sy = s_sz = 0;
+  s_sm = s_smm = 0;
   s_n = 0;
-  s_cuentas_por_g = (cuentas_por_g > 0.0f) ? cuentas_por_g : 1.0f;
 }
 
 void motion_add(const acc_raw_t *m)
 {
-  if (m == NULL) return;
+  if (m == NULL || s_n == 0xFFFFU) return;
 
-  acum_add(&s_x, m->x);
-  acum_add(&s_y, m->y);
-  acum_add(&s_z, m->z);
+  s_sx += m->x;
+  s_sy += m->y;
+  s_sz += m->z;
 
-  /* Magnitud en cuentas. En float: x²+y²+z² puede pasar de 3.000 millones
-   * y no entra en un entero de 32 bits con signo. */
+  /* Magnitud en float: x²+y²+z² puede pasar de 2^31 */
   float fx = m->x, fy = m->y, fz = m->z;
-  float mag = sqrtf(fx * fx + fy * fy + fz * fz);
-  acum_add(&s_mag, (int32_t)(mag + 0.5f));
-
+  int32_t mag = (int32_t)(sqrtf(fx * fx + fy * fy + fz * fz) * (float)MAG_ESCALA + 0.5f);
+  s_sm  += mag;
+  s_smm += (int64_t)mag * mag;
   s_n++;
 }
 
-void motion_compute(bolo_data_t *out)
+uint16_t motion_n(void)
+{
+  return s_n;
+}
+
+void motion_epoca(epoca_t *out)
 {
   if (out == NULL) return;
 
-  out->n_muestras = (uint16_t)s_n;
+  out->n_muestras = s_n;
 
-  if (s_n < MIN_MUESTRAS_VALIDAS)
+  if (s_n < ACC_MIN_VALIDAS)
   {
-    out->media      = (acc_vec_t){0};
-    out->desvio     = (acc_vec_t){0};
-    out->desvio_max = 0.0f;
-    out->desvio_mag = 0.0f;
-    out->estado     = BOLO_ESTADO_DESCONOCIDO;
+    out->x_mg = out->y_mg = out->z_mg = 0;
+    out->desvio_cod = FMT_DESVIO_INVALIDO;
     return;
   }
 
-  acum_stats(&s_x,   s_n, &out->media.x, &out->desvio.x);
-  acum_stats(&s_y,   s_n, &out->media.y, &out->desvio.y);
-  acum_stats(&s_z,   s_n, &out->media.z, &out->desvio.z);
-  acum_stats(&s_mag, s_n, NULL,          &out->desvio_mag);
+  out->x_mg = media_mg(s_sx, s_n);
+  out->y_mg = media_mg(s_sy, s_n);
+  out->z_mg = media_mg(s_sz, s_n);
 
-  out->desvio_max = fmaxf(out->desvio.x, fmaxf(out->desvio.y, out->desvio.z));
+  /* sigma = sqrt(n*Σx² - (Σx)²) / n, en enteros de 64 bits (sin cancelacion) */
+  int64_t num = (int64_t)s_n * s_smm - s_sm * s_sm;
+  if (num < 0) num = 0;
+  float sigma_cuentas = (sqrtf((float)num) / (float)s_n) / (float)MAG_ESCALA;
+  float sigma_mg      = sigma_cuentas * (1000.0f / (float)ACC_CUENTAS_POR_G);
 
-  if (out->desvio_mag >= UMBRAL_FUERTE_G)          /* ¿fue brusco? */
-  {
-    out->estado = BOLO_ESTADO_MOV_FUERTE;
-  }
-  else if (out->desvio_max >= UMBRAL_SUAVE_G)      /* ¿se movio?   */
-  {
-    out->estado = BOLO_ESTADO_MOV_SUAVE;
-  }
-  else
-  {
-    out->estado = BOLO_ESTADO_REPOSO;
-  }
+  out->desvio_cod = motion_desvio_codigo(sigma_mg);
 }

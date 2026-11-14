@@ -42,11 +42,17 @@ _estack = ORIGIN(RAM) + LENGTH(RAM); /* end of "RAM" Ram type memory */
 _Min_Heap_Size = 0x200; /* required amount of heap */
 _Min_Stack_Size = 0x400; /* required amount of stack */
 
-/* Memories definition */
+/* Memories definition
+ * BOLO_TX (T8): los 64 KB de RAM se usan como un solo bloque. En el STM32L43x la
+ * SRAM2 (16 KB) tambien aparece en 0x2000C000, justo despues de la SRAM1 (48 KB).
+ *   RAM    16 KB  sistema: periodo en armado (.noinit_sys), datos, pila
+ *   NOINIT 48 KB  almacen: nucleo 8 KB + aceleracion 40 KB (.noinit)
+ * Nada de NOINIT ni de .noinit_sys se borra al arrancar: sobreviven a un reset por
+ * watchdog y se validan con CRC. Toda la RAM se conserva en Stop 2. */
 MEMORY
 {
-  RAM    (xrw)    : ORIGIN = 0x20000000,   LENGTH = 48K
-  RAM2    (xrw)    : ORIGIN = 0x10000000,   LENGTH = 16K
+  RAM    (xrw)    : ORIGIN = 0x20000000,   LENGTH = 16K
+  NOINIT (rw)     : ORIGIN = 0x20004000,   LENGTH = 48K
   FLASH    (rx)    : ORIGIN = 0x8000000,   LENGTH = 256K
 }
 
@@ -132,6 +138,25 @@ SECTIONS
     PROVIDE_HIDDEN (__fini_array_end = .);
     . = ALIGN(4);
   } >FLASH
+
+  /* BOLO_TX: periodo en armado, al principio de la RAM (direccion fija entre
+   * compilaciones). NOLOAD: el arranque no lo toca. */
+  .noinit_sys (NOLOAD) :
+  {
+    . = ALIGN(4);
+    KEEP(*(.noinit_sys))
+    KEEP(*(.noinit_sys*))
+    . = ALIGN(4);
+  } >RAM
+
+  /* BOLO_TX: almacen de periodos (nucleo + aceleracion) */
+  .noinit (NOLOAD) :
+  {
+    . = ALIGN(4);
+    KEEP(*(.noinit))
+    KEEP(*(.noinit*))
+    . = ALIGN(4);
+  } >NOINIT
 
   /* Used by the startup to initialize data */
   _sidata = LOADADDR(.data);
